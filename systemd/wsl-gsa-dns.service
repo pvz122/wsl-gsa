@@ -1,0 +1,15 @@
+[Unit]
+Description=WSL GSA manual DNS bridge
+
+[Service]
+Type=simple
+EnvironmentFile=/run/wsl-gsa/environment
+ExecStart=/usr/bin/python3 /usr/local/lib/wsl-gsa/dns_bridge.py ${GSA_HOST}
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX

@@ -1,0 +1,14 @@
+[Unit]
+Description=WSL GSA manual transparent IPv4 TCP bridge
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/redsocks -c /run/wsl-gsa/redsocks.conf
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
