@@ -105,6 +105,8 @@ def main():
                         help="Also create and remove an isolated temporary br-* network namespace")
     args = parser.parse_args()
     gsa.validate_wsl()
+    check(not json.loads(command(["gsa", "autostart", "status", "--json"]))["enabled"],
+          "autostart initially disabled (disable it before integration testing)")
     check(json.loads(command(["gsa", "status", "--json"]))["state"] == "OFF",
           "bridge initially OFF (refuse to interrupt an active bridge)")
     baseline = firewall()
@@ -179,7 +181,7 @@ def main():
           "resolver contents and symlink unchanged")
     enabled = root("/usr/bin/systemctl", "show", "-p", "UnitFileState",
                    "wsl-gsa-tcp.service", "wsl-gsa-dns.service")
-    check(enabled.count("UnitFileState=static") == 2, "no service autostart")
+    check(enabled.count("UnitFileState=static") == 2, "relay units remain static")
     print("Integration complete; forwarding is OFF.", flush=True)
 
 

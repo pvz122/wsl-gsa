@@ -1,0 +1,13 @@
+[Unit]
+Description=Enable WSL GSA forwarding at distro boot (opt-in)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/wsl-gsa/autostart.py
+TimeoutStartSec=15min
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

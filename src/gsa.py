@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Manual WSL-to-Windows GSA bridge. No shell proxy configuration required."""
+"""WSL-to-Windows GSA bridge. No shell proxy configuration required."""
 
 import argparse
 import base64
@@ -82,8 +82,10 @@ def gateway():
 
 
 def system(action, host=None):
-    args = [executable("wsl.exe"), "--distribution", os.environ["WSL_DISTRO_NAME"],
-            "--user", "root", "--exec", "/usr/bin/python3", str(LIB / "system.py"), action]
+    helper = ["/usr/bin/python3", str(LIB / "system.py"), action]
+    args = helper if os.geteuid() == 0 else [
+        executable("wsl.exe"), "--distribution", os.environ["WSL_DISTRO_NAME"],
+        "--user", "root", "--exec", *helper]
     if host:
         args += ["--host", host]
     return json.loads(run(args, timeout=90))
@@ -189,7 +191,7 @@ def display(result, as_json):
         ("TCP relay", "active" if result["linux"]["tcp"] else "stopped"),
         ("DNS relay", "active" if result["linux"]["dns"] else "stopped"),
         ("IPv4 rules", "installed" if result["linux"]["rules"] else "absent"),
-        ("Autostart", "never"),
+        ("Autostart", "enabled (WSL boot)" if result["linux"]["autostart"] else "disabled"),
     ]
     for label, value in rows:
         print(f"  {label:<18} {value}")
@@ -205,7 +207,7 @@ def display(result, as_json):
 def main():
     parser = argparse.ArgumentParser(
         prog="gsa", description="Bridge new WSL IPv4 TCP + DNS through Windows GSA.",
-        epilog="Manual only. No default action, autostart, GSA policy changes or TLS interception.")
+        epilog="Manual by default. Optional WSL boot autostart; no GSA policy changes or TLS interception.")
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="action", required=True)
     for action, help_text in (("on", "Enable transparent forwarding"),
@@ -216,6 +218,9 @@ def main():
         if action == "status":
             item.add_argument("--probe", action="store_true", help="Also test one public HTTPS endpoint")
     sub.add_parser("uninstall", help="Stop and remove tool files; leave dependencies installed")
+    auto = sub.add_parser("autostart", help="Configure automatic forwarding at WSL distro boot")
+    auto.add_argument("mode", choices=("on", "off", "status"))
+    auto.add_argument("--json", action="store_true", help="Machine-readable output")
     args = parser.parse_args()
     validate_wsl()
     config = json.loads(CONFIG.read_text())
@@ -223,7 +228,18 @@ def main():
         raise RuntimeError("Installation belongs to a different distro. Reinstall in this distro.")
     with (LIB / "command.lock").open("r") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.action == "autostart":
+            action = {"on": "autostart-enable", "off": "autostart-disable",
+                      "status": "autostart-status"}[args.mode]
+            result = system(action)
+            if args.json:
+                print(json.dumps(result))
+            else:
+                print(f"Autostart: {'enabled (WSL boot)' if result['enabled'] else 'disabled'}.")
+                print("Current forwarding is unchanged. Use gsa on/off to change it now.")
+            return 0
         if args.action == "uninstall":
+            system("autostart-disable")
             system("stop")
             windows("stop")
             win = windows("uninstall")
@@ -236,6 +252,7 @@ def main():
             result = enable()
         else:
             if args.action == "off":
+                system("autostart-cancel")
                 system("stop")
                 windows("stop")
             result = get_status()
