@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Privileged manager: owns only one nftables table and two static units."""
+"""Privileged manager: owns one nftables table and the bridge's systemd units."""
 
 import argparse
 import fcntl
@@ -16,6 +16,25 @@ NFT = "/usr/sbin/nft"
 RUN = Path("/run/wsl-gsa")
 LIB = Path("/usr/local/lib/wsl-gsa")
 UNITS = ["wsl-gsa-tcp.service", "wsl-gsa-dns.service"]
+AUTOSTART = "wsl-gsa-autostart.service"
+AUTOSTART_CANCEL = Path("/run/wsl-gsa-autostart.cancelled")
+
+
+def autostart_status():
+    state = command(["/usr/bin/systemctl", "show", "--property=UnitFileState",
+                     "--value", AUTOSTART]).strip()
+    if state not in ("enabled", "enabled-runtime", "disabled", "masked", "masked-runtime"):
+        raise RuntimeError(f"Unexpected autostart unit state: {state!r}. Reinstall the bridge.")
+    return {"enabled": state in ("enabled", "enabled-runtime")}
+
+
+def autostart(enabled):
+    if enabled and not json.loads((LIB / "config.json").read_text()).get("windows_paths"):
+        raise RuntimeError("Autostart requires saved Windows executable paths. Reinstall the bridge.")
+    command(["/usr/bin/systemctl", "enable" if enabled else "disable", AUTOSTART])
+    if not enabled:
+        AUTOSTART_CANCEL.touch(mode=0o600, exist_ok=True)
+    return autostart_status()
 
 
 def command(args, **kwargs):
@@ -42,6 +61,7 @@ def unit_active(unit):
 def status():
     saved = RUN / "state.json"
     return {"rules": table_exists(), "tcp": unit_active(UNITS[0]), "dns": unit_active(UNITS[1]),
+            "autostart": autostart_status()["enabled"],
             "state": json.loads(saved.read_text()) if saved.exists() else None}
 
 
@@ -138,12 +158,14 @@ def start(host):
 
 
 def uninstall():
+    autostart(False)
+    command(["/usr/bin/systemctl", "stop", AUTOSTART])
     stop()
-    for unit in UNITS:
+    for unit in [*UNITS, AUTOSTART]:
         (Path("/etc/systemd/system") / unit).unlink(missing_ok=True)
     command(["/usr/bin/systemctl", "daemon-reload"])
     Path("/usr/local/bin/gsa").unlink(missing_ok=True)
-    for name in ("gsa.py", "system.py", "dns_bridge.py", "config.json", "command.lock"):
+    for name in ("gsa.py", "system.py", "dns_bridge.py", "autostart.py", "config.json", "command.lock"):
         (LIB / name).unlink(missing_ok=True)
     retained = []
     if any(LIB.iterdir()):
@@ -154,19 +176,29 @@ def uninstall():
         (RUN / name).unlink(missing_ok=True)
     if RUN.exists():
         RUN.rmdir()
+    AUTOSTART_CANCEL.unlink(missing_ok=True)
     return {"uninstalled": True, "retained_paths": retained}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("start", "stop", "status", "uninstall"))
+    parser.add_argument("action", choices=("start", "stop", "status", "uninstall",
+                                         "autostart-enable", "autostart-disable",
+                                         "autostart-status", "autostart-cancel"))
     parser.add_argument("--host")
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise RuntimeError("This helper requires WSL root.")
     with open("/run/wsl-gsa.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if args.action == "start":
+        if args.action == "autostart-cancel":
+            AUTOSTART_CANCEL.touch(mode=0o600, exist_ok=True)
+            result = {"cancelled": True}
+        elif args.action == "autostart-status":
+            result = autostart_status()
+        elif args.action in ("autostart-enable", "autostart-disable"):
+            result = autostart(args.action == "autostart-enable")
+        elif args.action == "start":
             if not args.host:
                 parser.error("start requires --host")
             result = start(args.host)

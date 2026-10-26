@@ -9,8 +9,8 @@
 
 `gsa on` &nbsp; / &nbsp; `gsa off` &nbsp; / &nbsp; `gsa status`
 
-Manual, transparent IPv4 TCP + DNS bridging for WSL 2.
-No shell proxy variables. No TLS decryption. No autostart.
+Transparent IPv4 TCP + DNS bridging for WSL 2, with optional distro-boot autostart.
+No shell proxy variables. No TLS decryption. Manual by default.
 
 [中文说明](docs/README.zh-CN.md)
 
@@ -20,6 +20,48 @@ No shell proxy variables. No TLS decryption. No autostart.
 > Microsoft documents that the Windows GSA client does not acquire WSL guest traffic.
 > This tool originates replacement connections from Windows instead. It neither
 > disables GSA nor changes organization policy. Use only where your organization permits it.
+
+## What is GSA, and why does WSL need a bridge?
+
+**GSA (Microsoft Entra Global Secure Access)** is Microsoft's umbrella for
+**Microsoft Entra Internet Access** and **Microsoft Entra Private Access**.
+Internet Access applies an organization's access controls to supported internet
+and Microsoft 365 traffic. Private Access provides identity-aware access to
+configured private applications/resources without exposing them publicly.
+Administrators configure traffic forwarding profiles and access policies; the
+Windows GSA client acquires applicable traffic and sends it through the service.
+Having the client installed does not mean every destination is acquired or allowed.
+
+WSL 2 runs Linux in a lightweight virtual machine. Its guest network traffic is
+not equivalent to traffic originating from a Windows application, and Microsoft
+documents that the Windows GSA client does not acquire WSL guest traffic.
+Consequently, Windows can reach a destination while `curl`, Git, package managers
+or development services inside WSL cannot. DNS is also relevant: GSA can return
+synthetic addresses for configured destinations, so forwarding TCP without using
+the corresponding Windows DNS path can produce inconsistent results.
+
+This tool bridges that gap for **new IPv4 TCP connections and ordinary port-53
+DNS**: Linux transparently redirects them to relays, and a Windows process opens
+replacement connections using Windows-native sockets. GSA then decides whether
+and how those Windows connections are acquired under your existing policy.
+It is not a GSA client for Linux, does not give WSL native GSA support, and does
+not replace Microsoft Entra licensing, administrator configuration or sign-in.
+
+### When it is useful
+
+- Windows can access an organization-approved private Git server, package
+  registry or TCP development endpoint through Private Access, but WSL cannot.
+- You need supported WSL development traffic to use your organization's existing
+  Internet Access path without setting separate proxy variables in every tool.
+- Background/system services or ordinary Docker bridge containers need the same
+  supported TCP/DNS path; shell-only proxy configuration would not cover them.
+
+Use it only after confirming the destination works on Windows and your organization
+permits this bridge. It will not fix Windows GSA sign-in failures, grant missing
+application permissions, override access denials or tunnel arbitrary protocols.
+If you need IPv6, QUIC/other UDP, a full VPN or guaranteed leak prevention, this
+tool is not sufficient. If WSL already works through an approved networking
+solution, you may not need it.
 
 ## Quick start
 
@@ -59,8 +101,8 @@ No restart is performed or needed on an **already compatible** system.
    An existing older Node runtime must be upgraded explicitly. Winget installation
    accepts its package/source agreements and may need Windows elevation; if this
    cannot run unattended, install official Node.js LTS yourself and retry.
-4. Install missing Linux dependencies with apt, then root-owned helpers and **static**
-   systemd units. A newly installed stock redsocks service is prevented from starting
+4. Install missing Linux dependencies with apt, then root-owned helpers, **static**
+   relay units and a disabled-by-default autostart unit. A newly installed stock redsocks service is prevented from starting
    and disabled; an existing redsocks service is not stopped or reconfigured.
 
 The tool does not install, repair, sign into, or reconfigure GSA. Runtime presence is
@@ -83,6 +125,9 @@ gsa status --probe      Also test https://www.microsoft.com over IPv4, without e
 gsa status --json       Script-friendly JSON; no ANSI formatting
 gsa on --json
 gsa off --json
+gsa autostart on         Enable forwarding automatically at the next WSL distro boot
+gsa autostart off        Disable future automatic activation; current forwarding unchanged
+gsa autostart status     Show the saved autostart preference (also accepts --json)
 gsa uninstall           Stop forwarding and remove this distro's installed tool files
 gsa --version
 gsa --help
@@ -95,6 +140,56 @@ restarted by `gsa on`; unexpected PID identity is never killed. Status exit code
 use argparse's exit code 2. `NO_COLOR=1` disables color; redirected output has no ANSI.
 Only `--probe` makes a public HTTPS request. One successful probe does not verify
 every site/port or prove which GSA forwarding profile acquired a connection.
+
+## Optional autostart mode
+
+Autostart is **opt-in and per WSL distribution**. Installation does not enable it;
+updates preserve the existing preference. Configure it from WSL:
+
+```sh
+gsa autostart on
+gsa on                   # optional: activate now as well
+gsa autostart status
+gsa status --json        # linux.autostart reports the boot preference
+```
+
+The enabled `wsl-gsa-autostart.service` runs when this distro's systemd starts,
+**not** whenever a shell opens. It does not start WSL at Windows login, create a
+Windows scheduled task, or keep an idle WSL instance alive. WSL idle shutdown
+and process lifetime behavior still apply. Do not enable it in several distros:
+only one active bridge is supported.
+
+The root-owned boot helper restores the installed distro name and Windows
+executable search paths, discovers a WSL interop socket, and uses the same
+locked activation/rollback path as `gsa on`. It waits for network startup and
+retries interop/GSA readiness failures up to **12 attempts**, **10 seconds between
+attempts**, with a **15-minute service startup limit**. With no active Linux
+forwarding, it stops a leftover managed Windows relay before activation, allowing
+the NAT gateway address to refresh after a WSL restart. It never signs into GSA,
+changes policy or bypasses Windows execution policy.
+
+GSA must still be running and signed in on Windows. Interop may not yet be
+available during an unattended distro boot; if readiness never arrives, startup
+fails visibly in the journal rather than reporting success. Inspect locally:
+
+```sh
+journalctl -u wsl-gsa-autostart.service -b
+gsa status
+gsa on                   # retry manually after fixing readiness
+```
+
+There is no continuous readiness monitor or automatic recovery after successful
+activation. If the network changes, use `gsa off && gsa on` as in manual mode.
+`gsa off` also cancels any remaining autostart attempts **for this boot** but
+leaves the next-boot preference enabled. To return to manual mode and stop now:
+
+```sh
+gsa autostart off         # also cancels pending startup attempts
+gsa off
+```
+
+Changing the autostart preference does not itself start or stop current forwarding.
+Uninstall disables and removes the boot unit. No shell startup files are modified.
 
 ## Precisely what gets forwarded
 
@@ -183,6 +278,7 @@ users; a per-Windows-user mutex serializes Windows controller operations.
 | `/usr/local/bin/gsa` | Root-owned CLI |
 | `/usr/local/lib/wsl-gsa/` | Root-owned helpers, distro/Windows path configuration and command lock |
 | `/etc/systemd/system/wsl-gsa-{tcp,dns}.service` | Manual/static units, no boot enablement |
+| `/etc/systemd/system/wsl-gsa-autostart.service` | Optional distro-boot activation; disabled by default |
 | `/run/wsl-gsa/` | Ephemeral relay configuration/state |
 | `%LOCALAPPDATA%\WslGsaBridge\<distro-hash>\` | Windows scripts, Node path, PID identity and bounded `bridge.log` |
 
@@ -224,7 +320,8 @@ breaking other software. Remove those separately only when you know they are unu
 Directories containing unknown files are retained and reported rather than deleted.
 The clone and MIT license remain yours; no shell configuration is modified.
 Reinstall/update by fetching the desired code, running `gsa off`, then `sh install.sh`.
-No background polling, scheduled task, enabled service or default activation is added.
+No Windows scheduled task or default activation is added. The optional boot helper
+only retries during startup; there is no background polling after activation.
 
 If the CLI is damaged, remove the interception first:
 
@@ -252,18 +349,19 @@ machine; CI cannot verify authentication or policy.
 
 On an authorized, installed WSL machine, the opt-in integration harness checks
 transparent HTTPS, explicit UDP/TCP DNS, local TCP/UDP, an empty-environment root
-service, idempotence, recovery, firewall/resolver preservation and no autostart:
+service, idempotence, recovery, firewall/resolver preservation and static relay units:
 
 ```sh
 python3 tests/integration.py --docker-bridge
 ```
 
-It requires the bridge to be OFF initially, temporarily enables it, creates/removes
+It requires the bridge to be OFF and autostart disabled initially, temporarily enables it, creates/removes
 an isolated test bridge/namespace when requested, and leaves forwarding OFF.
 Do not run it alongside other network changes.
 
 ## References and license
 
+- [Microsoft: What is Global Secure Access?](https://learn.microsoft.com/en-us/entra/global-secure-access/overview-what-is-global-secure-access)
 - [Microsoft: GSA current known limitations](https://learn.microsoft.com/en-us/entra/global-secure-access/reference-current-known-limitations)
 - [Microsoft: WSL networking](https://learn.microsoft.com/en-us/windows/wsl/networking)
 - [Microsoft: systemd in WSL](https://learn.microsoft.com/en-us/windows/wsl/systemd)

@@ -15,7 +15,7 @@ import gsa
 
 ROOT = Path(__file__).resolve().parent.parent
 LIB = Path("/usr/local/lib/wsl-gsa")
-UNITS = ("wsl-gsa-tcp.service", "wsl-gsa-dns.service")
+UNITS = ("wsl-gsa-tcp.service", "wsl-gsa-dns.service", "wsl-gsa-autostart.service")
 
 
 def root_install(config):
@@ -52,7 +52,7 @@ def root_install(config):
             subprocess.run(["systemctl", "disable", "redsocks.service"], check=True)
     LIB.mkdir(mode=0o755, parents=True, exist_ok=True)
     targets = [(ROOT / "src" / name, LIB / name, 0o644)
-               for name in ("gsa.py", "system.py", "dns_bridge.py")]
+               for name in ("gsa.py", "system.py", "dns_bridge.py", "autostart.py")]
     targets += [(ROOT / "systemd" / name, Path("/etc/systemd/system") / name, 0o644)
                 for name in UNITS]
     targets.append((ROOT / "src/gsa.py", Path("/usr/local/bin/gsa"), 0o755))
@@ -112,15 +112,17 @@ def main():
     installed = gsa.ps_script(
         f"& {gsa.ps_quote(setup)} -Action install -DistroKey {gsa.ps_quote(key)}")
     config = {"distro": distro, "version": gsa.VERSION,
+              "windows_paths": sorted({str(Path(gsa.executable(name)).parent)
+                                       for name in ("wsl.exe", "powershell.exe")}),
               "windows_control": installed["directory"] + "\\control.ps1"}
-    print("Installing Linux dependencies and root-owned static services...", flush=True)
+    print("Installing Linux dependencies and root-owned services...", flush=True)
     result = subprocess.run(
         [gsa.executable("wsl.exe"), "--distribution", distro, "--user", "root", "--exec",
          "/usr/bin/python3", str(ROOT / "src/install.py"), "--root-config", json.dumps(config)],
         stdin=subprocess.DEVNULL, timeout=900)
     if result.returncode:
         raise RuntimeError("Linux installation failed. Fix the reported error and rerun; Windows files remain installed.")
-    print("Installed. Forwarding is OFF; no startup entries were added.\n\n"
+    print("Installed. Forwarding is OFF; existing autostart preference is preserved (default: disabled).\n\n"
           "  gsa on\n  gsa status --probe\n  gsa off\n\n"
           "Read README.md for scope, trust boundary and uninstall instructions.")
 

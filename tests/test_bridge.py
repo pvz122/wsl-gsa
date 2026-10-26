@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 import gsa
+import autostart
 import dns_bridge
 import install
 
@@ -24,7 +25,7 @@ spec.loader.exec_module(system)
 
 
 def linux_state(rules=False, tcp=False, dns=False, state=None):
-    return dict(rules=rules, tcp=tcp, dns=dns, state=state)
+    return dict(rules=rules, tcp=tcp, dns=dns, state=state, autostart=False)
 
 
 class RuleTests(unittest.TestCase):
@@ -91,10 +92,200 @@ class RuleTests(unittest.TestCase):
 
     def test_units_are_manual_and_unprivileged(self):
         for unit in (SRC.parent / "systemd").glob("*.service"):
+            if unit.name == system.AUTOSTART:
+                continue
             text = unit.read_text()
             self.assertNotIn("[Install]", text)
             self.assertIn("DynamicUser=yes", text)
             self.assertIn("NoNewPrivileges=yes", text)
+
+
+class AutostartTests(unittest.TestCase):
+    def test_boot_unit_is_opt_in_and_bounded(self):
+        text = (SRC.parent / "systemd" / system.AUTOSTART).read_text()
+        self.assertIn("WantedBy=multi-user.target", text)
+        self.assertIn("After=network-online.target", text)
+        self.assertIn("TimeoutStartSec=15min", text)
+        self.assertNotIn("Restart=always", text)
+        self.assertIn(system.AUTOSTART, install.UNITS)
+
+    @patch.object(system, "command")
+    def test_enabled_status_and_inspection_errors(self, command):
+        for state, enabled in (("enabled\n", True), ("disabled\n", False), ("masked\n", False)):
+            command.return_value = state
+            self.assertEqual(system.autostart_status(), {"enabled": enabled})
+        command.return_value = ""
+        with self.assertRaisesRegex(RuntimeError, "Reinstall"):
+            system.autostart_status()
+        command.side_effect = RuntimeError("inspection failed")
+        with self.assertRaisesRegex(RuntimeError, "inspection failed"):
+            system.autostart_status()
+
+    @patch.object(system, "autostart_status", return_value={"enabled": True})
+    @patch.object(system, "command")
+    def test_enable_does_not_activate_forwarding(self, command, status):
+        with patch.object(Path, "read_text", return_value='{"windows_paths":["/windows"]}'):
+            self.assertEqual(system.autostart(True), {"enabled": True})
+        command.assert_called_once_with(["/usr/bin/systemctl", "enable", system.AUTOSTART])
+
+    @patch.object(system, "command", side_effect=RuntimeError("enable failed"))
+    def test_enable_failure_is_reported(self, command):
+        with patch.object(Path, "read_text", return_value='{"windows_paths":["/windows"]}'), \
+                self.assertRaisesRegex(RuntimeError, "enable failed"):
+            system.autostart(True)
+
+    @patch.object(system, "autostart_status", return_value={"enabled": False})
+    @patch.object(system, "command")
+    def test_disable_cancels_pending_boot_without_stopping_forwarding(self, command, status):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(system, "AUTOSTART_CANCEL", Path(folder) / "cancelled"):
+            system.autostart(False)
+            self.assertTrue(system.AUTOSTART_CANCEL.exists())
+        command.assert_called_once_with(["/usr/bin/systemctl", "disable", system.AUTOSTART])
+
+    @patch.object(autostart, "activate")
+    @patch.object(autostart, "prepare_environment")
+    @patch.object(autostart.time, "sleep")
+    def test_boot_retries_then_succeeds(self, sleep, prepare, activate):
+        activate.side_effect = [RuntimeError("GSA not ready"), None]
+        with patch.object(Path, "read_text", return_value='{"windows_paths":["/windows"]}'), \
+                patch("sys.stderr", new_callable=io.StringIO) as output:
+            autostart.main()
+        self.assertEqual(activate.call_count, 2)
+        sleep.assert_called_once_with(10)
+        self.assertIn("GSA not ready", output.getvalue())
+
+    @patch.object(autostart, "activate")
+    @patch.object(autostart, "prepare_environment", side_effect=RuntimeError("interop unavailable"))
+    @patch.object(autostart.time, "sleep")
+    def test_boot_eventually_fails_explicitly(self, sleep, prepare, activate):
+        with patch.object(Path, "read_text", return_value='{"windows_paths":["/windows"]}'), \
+                patch("sys.stderr", new_callable=io.StringIO), \
+                self.assertRaisesRegex(RuntimeError, "interop unavailable"):
+            autostart.main()
+        self.assertEqual(prepare.call_count, 12)
+        self.assertEqual(sleep.call_count, 11)
+        activate.assert_not_called()
+
+    def test_boot_restores_environment_from_saved_paths_and_socket(self):
+        with tempfile.TemporaryDirectory() as folder, \
+                socket.socket(socket.AF_UNIX) as listener:
+            path = Path(folder) / "42_interop"
+            listener.bind(str(path))
+            with patch.object(Path, "glob", return_value=[path]), \
+                    patch.dict(gsa.os.environ, {}, clear=True):
+                autostart.prepare_environment({"distro": "TestDistro", "windows_paths": ["/windows"]})
+                self.assertEqual(gsa.os.environ["WSL_DISTRO_NAME"], "TestDistro")
+                self.assertEqual(gsa.os.environ["WSL_INTEROP"], str(path))
+                self.assertIn("/windows", gsa.os.environ["PATH"].split(":"))
+
+    @patch.object(gsa, "validate_wsl")
+    @patch.object(gsa, "enable", return_value={"state": "ON"})
+    @patch.object(gsa, "display")
+    @patch.object(gsa, "windows")
+    @patch.object(gsa, "system")
+    def test_boot_replaces_windows_relay_left_by_previous_wsl_session(
+            self, system_call, windows, display, enable, validate):
+        system_call.side_effect = [{"enabled": True}, linux_state()]
+        with tempfile.TemporaryDirectory() as folder, patch.object(gsa, "LIB", Path(folder)), \
+                patch.object(Path, "exists", return_value=False):
+            (gsa.LIB / "command.lock").touch()
+            autostart.activate()
+        windows.assert_called_once_with("stop")
+        enable.assert_called_once_with()
+
+    @patch.object(gsa, "enable")
+    @patch.object(gsa, "system", return_value={"enabled": True})
+    def test_manual_off_cancels_pending_boot(self, system_call, enable):
+        with tempfile.TemporaryDirectory() as folder, patch.object(gsa, "LIB", Path(folder)), \
+                patch.object(Path, "exists", return_value=True), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            (gsa.LIB / "command.lock").touch()
+            autostart.activate()
+        enable.assert_not_called()
+
+    @patch.object(gsa.os, "geteuid", return_value=0)
+    @patch.object(gsa, "run", return_value='{"enabled":false}')
+    def test_root_service_does_not_reenter_wsl(self, run, uid):
+        self.assertEqual(gsa.system("autostart-status"), {"enabled": False})
+        self.assertEqual(run.call_args.args[0][0], "/usr/bin/python3")
+
+    @patch.object(gsa.os, "geteuid", return_value=1000)
+    @patch.object(gsa, "executable", return_value="/windows/wsl.exe")
+    @patch.object(gsa, "run", return_value='{"enabled":false}')
+    def test_normal_user_keeps_wsl_root_elevation(self, run, executable, uid):
+        with patch.dict(gsa.os.environ, {"WSL_DISTRO_NAME": "TestDistro"}):
+            gsa.system("autostart-status")
+        self.assertEqual(run.call_args.args[0][:6],
+                         ["/windows/wsl.exe", "--distribution", "TestDistro",
+                          "--user", "root", "--exec"])
+
+    @patch.object(gsa, "validate_wsl")
+    @patch.object(gsa, "system", return_value={"enabled": True})
+    @patch.object(gsa, "windows")
+    def test_cli_autostart_json_does_not_start_windows(self, windows, system_call, validate):
+        with tempfile.TemporaryDirectory() as folder, patch.object(gsa, "LIB", Path(folder)), \
+                patch.object(gsa, "CONFIG", Path(folder) / "config.json"), \
+                patch.dict(gsa.os.environ, {"WSL_DISTRO_NAME": "TestDistro"}), \
+                patch.object(sys, "argv", ["gsa", "autostart", "on", "--json"]), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            gsa.CONFIG.write_text('{"distro":"TestDistro"}')
+            (gsa.LIB / "command.lock").touch()
+            self.assertEqual(gsa.main(), 0)
+            self.assertEqual(json.loads(output.getvalue()), {"enabled": True})
+        system_call.assert_called_once_with("autostart-enable")
+        windows.assert_not_called()
+
+    @patch.object(gsa, "validate_wsl")
+    @patch.object(gsa, "get_status", return_value={"state": "OFF"})
+    @patch.object(gsa, "system")
+    @patch.object(gsa, "windows")
+    def test_cli_off_cancels_startup_before_removing_rules(self, windows, system_call, status, validate):
+        events = []
+        system_call.side_effect = lambda action: events.append(action)
+        windows.side_effect = lambda action: events.append("windows-" + action)
+        with tempfile.TemporaryDirectory() as folder, patch.object(gsa, "LIB", Path(folder)), \
+                patch.object(gsa, "CONFIG", Path(folder) / "config.json"), \
+                patch.dict(gsa.os.environ, {"WSL_DISTRO_NAME": "TestDistro"}), \
+                patch.object(sys, "argv", ["gsa", "off", "--json"]), \
+                patch("sys.stdout", new_callable=io.StringIO):
+            gsa.CONFIG.write_text('{"distro":"TestDistro"}')
+            (gsa.LIB / "command.lock").touch()
+            self.assertEqual(gsa.main(), 0)
+        self.assertEqual(events, ["autostart-cancel", "stop", "windows-stop"])
+
+    @patch.object(gsa, "validate_wsl")
+    @patch.object(gsa, "enable", return_value={"state": "ON"})
+    @patch.object(gsa, "display")
+    @patch.object(gsa, "windows")
+    @patch.object(gsa, "system")
+    def test_boot_does_not_stop_an_already_active_bridge(
+            self, system_call, windows, display, enable, validate):
+        system_call.side_effect = [{"enabled": True}, linux_state(True, True, True)]
+        with tempfile.TemporaryDirectory() as folder, patch.object(gsa, "LIB", Path(folder)), \
+                patch.object(Path, "exists", return_value=False):
+            (gsa.LIB / "command.lock").touch()
+            autostart.activate()
+        windows.assert_not_called()
+        enable.assert_called_once_with()
+
+    @patch.object(system, "autostart")
+    @patch.object(system, "stop")
+    @patch.object(system, "command")
+    def test_uninstall_disables_and_removes_boot_files(self, command, stop, auto):
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(system, "LIB", Path(folder) / "lib"), \
+                patch.object(system, "RUN", Path(folder) / "run"), \
+                patch.object(system, "AUTOSTART_CANCEL", Path(folder) / "cancelled"), \
+                patch.object(Path, "unlink", autospec=True) as unlink:
+            system.LIB.mkdir()
+            boot_script = system.LIB / "autostart.py"
+            result = system.uninstall()
+        self.assertTrue(result["uninstalled"])
+        auto.assert_called_once_with(False)
+        removed = [call.args[0] for call in unlink.call_args_list]
+        self.assertIn(boot_script, removed)
+        self.assertIn(Path("/etc/systemd/system") / system.AUTOSTART, removed)
 
 
 class CLITests(unittest.TestCase):
